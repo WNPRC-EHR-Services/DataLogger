@@ -1,17 +1,21 @@
-#!perl -w
+#! /usr/local/bin/perl -w
 
-####################################################################################################################################################################################### 
-###                                                                                                                                                                                 ###
-### DataloggerASTM - Copyright (c) 2012 by Mariano Jorge Obarrio Miles.                                                                                                             ###
-### This work is made available under the terms of licensed under a Creative Commons Reconocimiento-NoComercial 3.0 Unported License http://creativecommons.org/licenses/by-nc/3.0/ ###
-### Legal Code (the full license): http://creativecommons.org/licenses/by-nc/3.0/legalcode                                                                                          ###
-###                                                                                                                                                                                 ###
-#######################################################################################################################################################################################
+######################################################################################################
+###                                                                                                ###
+### DataloggerASTM - Copyright (c) 2012 by Mariano Jorge Obarrio Miles.                            ###
+### This work is made available under the terms of licensed under a Creative Commons               ###
+### Reconocimiento-NoComercial 3.0 Unported License http://creativecommons.org/licenses/by-nc/3.0/ ###
+### Legal Code (the full license): http://creativecommons.org/licenses/by-nc/3.0/legalcode         ###
+###                                                                                                ###
+######################################################################################################
 #
-
+# modified to use Device::SerialPort instead of Win32::SerialPort, Device::SerailPort does not include
+# "transmit_char" so used "write" instead. converted some output messages to english. TWL 2019/05/01.
+# added a check to make sure the database connection is still valid after waiting for "ENQ". TWL 2019/06/04.
+#
 use strict;
 use warnings;
-use Win32::SerialPort; # on Windows 
+use Device::SerialPort;
 use Getopt::Long;
 use POSIX;
 use DBI;
@@ -31,41 +35,41 @@ my $Config 				= Config::Tiny->new;
 my $conffile 			= 'DataLogger.conf';
 my (%Resultados, %Data) = ();
 my $db					= "ASTM";
-my $host				= "192.168.1.66";
+my $host				= "10.128.240.200";
 my $port				= "3306";
 my $userid				= "astm";
 my $passwd				= "astm123";
-my $DEVICE				= "com1";
-my $baudrate			= 57600;
-my $databits			= 8; 
+my $DEVICE				= "/dev/cu.usbserial-1410";
+my $baudrate			= 9600;
+my $databits			= 8;
 my $stopbits			= 1;
 my $parity				= "none";
 my $handshake			= "none"; # following: "none", "rts", "xoff", "dtr".
 my $output				= "sql";
-my $record_termination 	= 2; # 1 CR, 2 CRLF
+my $record_termination 	= 1; # 1 CR, 2 CRLF
 my $delay   			= 60;
 my ($help, $ckSum, $bool, $quiet, $debug, $schema, $numPac) = (0) x 7;
 my ($dbh, $now, $count, $result, $HexRes, $registro, $ck, $idHeader, $idPatient, $idOrden, $idResult, $idComment) = ("") x 12;
 my ($serial, $RefField ,$FrameNumber , $FrameType, $PPID, $HID, $PID, $OID, $RID, $CID, $id) = ("") x 11;
 my $logtime 			= strftime "%Y-%m-%d %H:%M:%S", localtime;
 my %CampoTipo = (
-				 C => "Comentario", 
-				 H => "Cabecera", 
-				 O => "Orden", 
-				 P => "Paciente", 
-				 R => "Resultado", 
-				 Q => "Consulta (Solicita informacion de la orden)",
-				 M => "Informacion del fabricante",
-				 S => "Scientific Record",
-				 L => "Terminador de Registro"
-				);
+	C => "Comment",
+	H => "Header",
+	O => "Order",
+	P => "Patient",
+	R => "Result",
+	Q => "Request",
+	M => "Manufacturer Record",
+	S => "Scientific Record",
+	L => "Message Terminator"
+);
 
 my %Signals = 	(
-					CR   => "\x0d", NUL  => "\x00", SOH  => "\x01", STX  => "\x02",	ETX  => "\x03",	EOT  => "\x04",	ENQ  => "\x05",
-					ACK  => "\x06", BEL  => "\x07",	BS   => "\x08", HT   => "\x09",	LF   => "\x0a",	VT   => "\x0b",	FF   => "\x0c",
-					SO   => "\x0e",	SI   => "\x0f", DLE  => "\x10",	DC1  => "\x11",	DC2  => "\x12",	DC3  => "\x13", DC4  => "\x14", 
-					NAK  => "\x15",	SYN  => "\x16", ETB  => "\x17"
-				);         
+	CR   => "\x0d", NUL  => "\x00", SOH  => "\x01", STX  => "\x02",	ETX  => "\x03",	EOT  => "\x04",	ENQ  => "\x05",
+	ACK  => "\x06", BEL  => "\x07",	BS   => "\x08", HT   => "\x09",	LF   => "\x0a",	VT   => "\x0b",	FF   => "\x0c",
+	SO   => "\x0e",	SI   => "\x0f", DLE  => "\x10",	DC1  => "\x11",	DC2  => "\x12",	DC3  => "\x13", DC4  => "\x14",
+	NAK  => "\x15",	SYN  => "\x16", ETB  => "\x17"
+);
 
 if (-e $conffile)
 {
@@ -109,15 +113,17 @@ $Config->{General}->{record_termination} = $record_termination;
 $Config->write( $conffile );
 
 GetOptions (
-			"debug"            => \$debug,
-			"schema"           => \$schema,
-			"help|usage|?"     => \$help
-			);
+	"debug"            => \$debug,
+	"schema"           => \$schema,
+	"help|usage|?"     => \$help
+);
 
-			
+#print "Debug  " if($debug);
+
+
 # Definicion de Prototipos de la funciones
-sub openPort($); 
-sub closePort($); 
+sub openPort($);
+sub closePort($);
 sub usage;
 sub ChkSUM;
 sub insertSQL;
@@ -143,13 +149,13 @@ if($output eq "sql")
 my ($ENQ) = 0;
 my ($BytesRX) = 0;
 my $filename = md5_hex(luniqid);
-logInfo("Esperando Inicio de Trasmicion [ENQ].\n");
+logInfo("Waiting for transmission [ENQ].\n");
 while(1)
 {
 	$count  = 0;
 	$result = "";
 	($count, $result) = $serial->read(1);
-	
+
 	# Con el usleep intento reducir el numero de ciclos de CPU generados por el While
 	if($count == 0) { usleep(2000); next; }
 
@@ -159,63 +165,69 @@ while(1)
 	# Pasa a Hexa el byte leido
 	$HexRes = unpack ("H*", $result);
 	if($HexRes =~ /05/)
-	{		
-			# Si ENQ == 1 El archivo no fue procesado!
-			if($ENQ == 1)
-			{
-				# Incluye un CR en el archivo TRC
-				updateTRC($filename,"\n");
-
-				my $now = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime);
-				print STDERR "$now - BAD TRANSFER: Se recibe un ENQ sin ser enviado un EOT.\n";
-				print STDERR "$now -               Posible registro truncado o corrupto Header_ID:[$filename]\n";
-				logInfo("\t- BAD TRANSFER: Se recibe un ENQ sin ser enviado un EOT.\n");
-				logInfo("\t                Posible registro truncado o corrupto Header_ID:[$filename]\n");
-				
-				# Transforma TRC a TXT y luego de TXT a MySQL
-				($numPac) = TXT2SQL( TRC2TXT($filename) ); 
-
-				# Actualiza el numero de pacientes si los hay! 
-				# Recordar que $filename es igual que el $HID (Header_ID de la tabla Header)
-				updateNumPac($filename, $numPac) if(($numPac gt 0) && ($output eq "sql"));
-				logInfo("\t- $numPac Pacientes procesados Header_ID:[$filename]\n");
-
-				# Genera un nuevo Archivo
-				$filename = md5_hex(luniqid); 
-				logInfo("Esperando Inicio de Trasmicion [ENQ].\n");
-			}
-			logInfo("\t- Reciviendo datos y generando ${filename}.trc\n");
-
+	{
+		# Si ENQ == 1 El archivo no fue procesado!
+		if($ENQ == 1)
+		{
 			# Incluye un CR en el archivo TRC
 			updateTRC($filename,"\n");
 
-			$serial->transmit_char(0x06);
-			$ENQ     = 1;
-			$BytesRX = 0;
-	}
-	elsif($HexRes =~ /15|0a|0A/) { $serial->transmit_char(0x06); } 
-	elsif($HexRes =~ /04/) 
-	{ 
-			# Inicio y Fin de transferencia correcto ENQ <-> EOT
-			$ENQ = 0;
-			
-			#my $filesize = stat("${filename}.trc")->size;
-			#logInfo("\tSize: ${filename}.trc\n");
-			
-			# Incluye un CR en el archivo TRC
-			updateTRC($filename,"\n");
-			
+			my $now = POSIX::strftime("%Y-%m-%d %H:%M:%S", localtime);
+			print STDERR "$now - BAD TRANSFER: Se recibe un ENQ sin ser enviado un EOT.\n";
+			print STDERR "$now -               Posible registro truncado o corrupto Header_ID:[$filename]\n";
+			logInfo("\t- BAD TRANSFER: Se recibe un ENQ sin ser enviado un EOT.\n");
+			logInfo("\t                Posible registro truncado o corrupto Header_ID:[$filename]\n");
+
 			# Transforma TRC a TXT y luego de TXT a MySQL
-			($numPac) = TXT2SQL( TRC2TXT($filename) ); 
+			($numPac) = TXT2SQL( TRC2TXT($filename) );
 
-			# Actualiza el numero de pacientes si los hay! 
+			# Actualiza el numero de pacientes si los hay!
 			# Recordar que $filename es igual que el $HID (Header_ID de la tabla Header)
 			updateNumPac($filename, $numPac) if(($numPac gt 0) && ($output eq "sql"));
-			logInfo("\t- $numPac Pacientes procesados Header_ID:[$filename]\n");
-		
+			#				logInfo("\t- $numPac Pacientes procesados Header_ID:[$filename]\n");
+			logInfo("\t- $numPac Patients Processed Header_ID:[$filename]\n");
 			# Genera un nuevo Archivo
-			$filename = md5_hex(luniqid); 
-			logInfo("Esperando Inicio de Trasmicion [ENQ].\n");
+			$filename = md5_hex(luniqid);
+			#				logInfo("Esperando Inicio de Trasmicion [ENQ].\n");
+			logInfo("Waiting for initial transmission [ENQ].\n");
+		}
+		#			logInfo("\t- Reciviendo datos y generando ${filename}.trc\n");
+		logInfo("\t- Receiving data and generating ${filename}.trc\n");
+
+		# Incluye un CR en el archivo TRC
+		updateTRC($filename,"\n");
+
+		$serial->write($Signals{ACK});
+		$ENQ     = 1;
+		$BytesRX = 0;
+	}
+	elsif($HexRes =~ /15|0a|0A/) {
+		#		$serial->lookclear; # may need this since transmit_char not available?
+		$serial->write($Signals{ACK}); }
+	elsif($HexRes =~ /04/)
+	{
+		# Inicio y Fin de transferencia correcto ENQ <-> EOT
+		$ENQ = 0;
+
+		#my $filesize = stat("${filename}.trc")->size;
+		#logInfo("\tSize: ${filename}.trc\n");
+
+		# Incluye un CR en el archivo TRC
+		updateTRC($filename,"\n");
+
+		# Transforma TRC a TXT y luego de TXT a MySQL
+		($numPac) = TXT2SQL( TRC2TXT($filename) );
+
+		# Actualiza el numero de pacientes si los hay!
+		# Recordar que $filename es igual que el $HID (Header_ID de la tabla Header)
+		updateNumPac($filename, $numPac) if(($numPac gt 0) && ($output eq "sql"));
+		#			logInfo("\t- $numPac Pacientes procesados Header_ID:[$filename]\n");
+		logInfo("\t- $numPac Patients Processed Header_ID:[$filename]\n");
+
+		# Genera un nuevo Archivo
+		$filename = md5_hex(luniqid);
+		#			logInfo("Esperando Inicio de Trasmicion [ENQ].\n");
+		logInfo("Waiting for initial transmission [ENQ].\n");
 	}
 	# usleep(500);
 	usleep(2000); # 0.002 Microsegndo | 1.000.000 Microsegundos == 1 Segundo
@@ -227,20 +239,21 @@ closePort($serial);
 sub TXT2SQL
 {
 	no warnings;
-	
-    return unless (@_ == 1);
+
+	return unless (@_ == 1);
 	my $filename = shift;
 	$filename //= '';
 
-	logInfo("\t- Convirtiendo TXT a SQL.\n");
+	#	logInfo("\t- Convirtiendo TXT a SQL.\n");
+	logInfo("\t- Converting TXT to SQL.\n");
 	open(FILE_IN,  "<${filename}.txt") or die $!;
-	
+
 	my ($numPac) = 0;
 
 	# Read the input file line by line
 	my $registro = "";
 	while(<FILE_IN>)
-	{ 
+	{
 		chop($_);
 		$registro  = $_;
 		$FrameNumber = substr($_,0,1); # Campo Numero
@@ -248,20 +261,20 @@ sub TXT2SQL
 
 		# Procesa el registro segun el tipo de dato
 		if($FrameType =~ /H|h/)
-		{ 
-				updateNumPac($HID,$numPac) if(($numPac gt 0) && ($output eq "sql"));
-				
-				# Asignamos el nombre del archivo en hexa como clave en el Header. De esta forma podemos relacionar fisicamente el archivo con MySQL
-				$HID    = $filename; #$HID    = md5_hex(luniqid);
-				($PPID, $CID, $RID, $OID, $PID) = ""; 
-				$numPac = 0;
-		} 
+		{
+			updateNumPac($HID,$numPac) if(($numPac gt 0) && ($output eq "sql"));
+
+			# Asignamos el nombre del archivo en hexa como clave en el Header. De esta forma podemos relacionar fisicamente el archivo con MySQL
+			$HID    = $filename; #$HID    = md5_hex(luniqid);
+			($PPID, $CID, $RID, $OID, $PID) = "";
+			$numPac = 0;
+		}
 		elsif($FrameType =~ /P|p/) { $PID = md5_hex(luniqid); ($PPID, $CID, $RID,$OID)  = ""; $numPac++; }
 		elsif($FrameType =~ /O|o/) { $OID = md5_hex(luniqid); ($PPID, $CID, $RID) = ""; }
-		elsif($FrameType =~ /R|r/) { $RID = md5_hex(luniqid); ($PPID, $CID) = ""; } 
+		elsif($FrameType =~ /R|r/) { $RID = md5_hex(luniqid); ($PPID, $CID) = ""; }
 		elsif($FrameType =~ /C|c/)
-		{ 
-			$CID = md5_hex(luniqid); 
+		{
+			$CID = md5_hex(luniqid);
 			if   (!$PID && !$OID && !$RID) { $PPID = $HID; $RefField = "Header_ID";  } # $CID = md5_hex($HID); - Comentario de la Cabecera
 			elsif(!$OID && !$RID)          { $PPID = $PID; $RefField = "Patient_ID"; } # $CID = md5_hex($PID); - Comentario del Paciente
 			elsif(!$RID)                   { $PPID = $OID; $RefField = "Orden_ID";   } # $CID = md5_hex($OID); - Comentario de la Orden
@@ -277,12 +290,13 @@ sub TXT2SQL
 sub TRC2TXT
 {
 	no warnings;
-	
+
 	return unless (@_ == 1);
 	my $filename = shift;
 	$filename //= '';
 
-	logInfo("\t- Convirtiendo TRC a TXT.\n");
+	#	logInfo("\t- Convirtiendo TRC a TXT.\n");
+	logInfo("\t- Converting TRC to TXT.\n");
 	open(FILE_IN,  "<${filename}.trc") or die $!;
 	open(FILE_OUT, ">${filename}.txt") or die $!;
 
@@ -323,7 +337,7 @@ sub TRC2TXT
 	}
 	close(FILE_IN);
 	close(FILE_OUT);
-	
+
 	return($filename);
 }
 
@@ -344,144 +358,144 @@ sub Send2MySQL
 	if($FrameType =~ /H|h/)
 	{
 		$id = $HID;
-		%Data = 
+		%Data =
 			(
-				"Header_$id" => 
-				{
-					"Header_ID"                 => $HID,
-					"Access_Password" 			=> $campos[3], 
-					"Sender_Name" 				=> $campos[4], 
-					"Sender_Address" 			=> $campos[5], 
-					"Reserved" 					=> $campos[6], 
-					"Sender_Telephone" 			=> $campos[7], 
-					"Characteristics_Of_Sender" => $campos[8], 
-					"Receiver_ID" 				=> $campos[9], 
-					"Comments" 					=> $campos[10], 
-					"Processing_ID" 			=> $campos[11], 
-					"ASTM_Version" 				=> $campos[12], 
-					"Date_and_Time" 		    => $campos[13],
-					"Status"                    => $Status,
-					"Checksum" 					=> $ck
-				}
+				"Header_$id" =>
+					{
+						"Header_ID"                 => $HID,
+						"Access_Password" 			=> $campos[3],
+						"Sender_Name" 				=> $campos[4],
+						"Sender_Address" 			=> $campos[5],
+						"Reserved" 					=> $campos[6],
+						"Sender_Telephone" 			=> $campos[7],
+						"Characteristics_Of_Sender" => $campos[8],
+						"Receiver_ID" 				=> $campos[9],
+						"Comments" 					=> $campos[10],
+						"Processing_ID" 			=> $campos[11],
+						"ASTM_Version" 				=> $campos[12],
+						"Date_and_Time" 		    => $campos[13],
+						"Status"                    => $Status,
+						"Checksum" 					=> $ck
+					}
 			);
 	}
 	elsif($FrameType =~ /P|p/)
 	{
 		$id = $PID;
-		%Data = 
+		%Data =
 			(
-				"Patient_$id" => 
-				{
-					"Patient_ID"                                                => $PID,
-					"Header_ID"                                                 => $HID,
-					"Sequence" 													=> $campos[1],
-					"Practice_Assigned_Patient_ID" 								=> $campos[2],
-					"Laboratory_Assigned_Patient_ID" 							=> $campos[3],
-					"Patient_ID_No_3" 											=> $campos[4],
-					"Patient_Name_Name_First_name" 								=> $campos[5],
-					"Mothers_Maiden_Name" 										=> $campos[6],
-					"Birthdate" 												=> $campos[7],
-					"Patient_Sex" 												=> $campos[8],
-					"Patient_Race_thnic_Origin" 								=> $campos[9],
-					"Patient_Address" 											=> $campos[10],
-					"Reserved" 													=> $campos[11],
-					"Patient_Telephone_Nb" 										=> $campos[12],
-					"Attending_Physician_ID" 									=> $campos[13],
-					"Special_Field_1" 											=> $campos[14],
-					"Special_Field_2" 											=> $campos[15],
-					"Patient_Height" 											=> $campos[16],
-					"Patient_Weight" 											=> $campos[17],
-					"Patients_Known_or_Suspected_Diagnosis" 					=> $campos[18],
-					"Patient_Active_Medication" 								=> $campos[19],
-					"Patients_Diet" 											=> $campos[20],
-					"Practice_Field_1" 											=> $campos[21],
-					"Practice_Field_2" 											=> $campos[22],
-					"Admission_and_Discharge_Dates" 							=> $campos[23],
-					"Admission_Status" 											=> $campos[24],
-					"Location" 													=> $campos[25],
-					"Nature_of_Alternative_Diagnostic_Code_and_Classifiers_1" 	=> $campos[26],
-					"Nature_of_Alternative_Diagnostic_Code_and_Classifiers_2" 	=> $campos[27],
-					"Patient_Religion" 											=> $campos[28],
-					"Martial_status" 											=> $campos[29],
-					"Isolation_Status" 											=> $campos[30],
-					"Language" 													=> $campos[31],
-					"Hospital_Service" 											=> $campos[32],
-					"Hopital_Institution" 										=> $campos[33],
-					"Dosage_Category" 											=> $campos[34],
-					"Status"                                                    => $Status,
-					"Checksum" 													=> $ck				
-				}
+				"Patient_$id" =>
+					{
+						"Patient_ID"                                                => $PID,
+						"Header_ID"                                                 => $HID,
+						"Sequence" 													=> $campos[1],
+						"Practice_Assigned_Patient_ID" 								=> $campos[2],
+						"Laboratory_Assigned_Patient_ID" 							=> $campos[3],
+						"Patient_ID_No_3" 											=> $campos[4],
+						"Patient_Name_Name_First_name" 								=> $campos[5],
+						"Mothers_Maiden_Name" 										=> $campos[6],
+						"Birthdate" 												=> $campos[7],
+						"Patient_Sex" 												=> $campos[8],
+						"Patient_Race_thnic_Origin" 								=> $campos[9],
+						"Patient_Address" 											=> $campos[10],
+						"Reserved" 													=> $campos[11],
+						"Patient_Telephone_Nb" 										=> $campos[12],
+						"Attending_Physician_ID" 									=> $campos[13],
+						"Special_Field_1" 											=> $campos[14],
+						"Special_Field_2" 											=> $campos[15],
+						"Patient_Height" 											=> $campos[16],
+						"Patient_Weight" 											=> $campos[17],
+						"Patients_Known_or_Suspected_Diagnosis" 					=> $campos[18],
+						"Patient_Active_Medication" 								=> $campos[19],
+						"Patients_Diet" 											=> $campos[20],
+						"Practice_Field_1" 											=> $campos[21],
+						"Practice_Field_2" 											=> $campos[22],
+						"Admission_and_Discharge_Dates" 							=> $campos[23],
+						"Admission_Status" 											=> $campos[24],
+						"Location" 													=> $campos[25],
+						"Nature_of_Alternative_Diagnostic_Code_and_Classifiers_1" 	=> $campos[26],
+						"Nature_of_Alternative_Diagnostic_Code_and_Classifiers_2" 	=> $campos[27],
+						"Patient_Religion" 											=> $campos[28],
+						"Martial_status" 											=> $campos[29],
+						"Isolation_Status" 											=> $campos[30],
+						"Language" 													=> $campos[31],
+						"Hospital_Service" 											=> $campos[32],
+						"Hopital_Institution" 										=> $campos[33],
+						"Dosage_Category" 											=> $campos[34],
+						"Status"                                                    => $Status,
+						"Checksum" 													=> $ck
+					}
 			);
 	}
 	elsif($FrameType =~ /O|o/)
 	{
 		$id = $OID;
-		%Data = 
+		%Data =
 			(
-				"Orden_$id" => 
-				{
-					"Orden_ID"                                          => $OID,
-					"Patient_ID"										=> $PID,
-					"Sequence" 											=> $campos[1],
-					"Sample_ID" 										=> $campos[2],
-					"Instrument_Specimen_ID" 							=> $campos[3],
-					"Universal_Test_ID" 								=> $campos[4],
-					"Priority" 											=> $campos[5],
-					"Requested_Ordered_Date_and_Time" 					=> $campos[6],
-					"Specimen_Collection_Date_and_Time" 				=> $campos[7],
-					"Collection_End_Time" 								=> $campos[8],
-					"Collection_Volume" 								=> $campos[9],
-					"Collector_ID" 										=> $campos[10],
-					"Action_Code" 										=> $campos[11],
-					"Danger_Code" 										=> $campos[12],
-					"Relevant_Clinical_Informations" 					=> $campos[13],
-					"Date_Time_Specimen_Received" 						=> $campos[14],
-					"Specimen_Descriptor" 								=> $campos[15],
-					"Ordering_Physician" 								=> $campos[16],
-					"Physician_Tel_Nb" 									=> $campos[17],
-					"User_Field_1" 										=> $campos[18],
-					"User_Field_2" 										=> $campos[19],
-					"Laboratory_Field_1" 								=> $campos[20],
-					"Laboratory_Field_2" 								=> $campos[21],
-					"Date_and_Time_Results_reported_or_last_modified" 	=> $campos[22],
-					"Instrument_Charge_to_Computer_System" 				=> $campos[23],
-					"Instrument_Section_ID" 							=> $campos[24],
-					"Report_Types" 										=> $campos[25],
-					"Reserved" 											=> $campos[26],
-					"Location_or_Ward_of_Specimen_Collection" 			=> $campos[27],
-					"Nosocomial_Infection_Flag" 						=> $campos[28],
-					"Specimen_Service" 									=> $campos[29],
-					"Specimen_institution" 								=> $campos[30],
-					"Status"                                            => $Status,
-					"Checksum" 											=> $ck
-				}
+				"Orden_$id" =>
+					{
+						"Orden_ID"                                          => $OID,
+						"Patient_ID"										=> $PID,
+						"Sequence" 											=> $campos[1],
+						"Sample_ID" 										=> $campos[2],
+						"Instrument_Specimen_ID" 							=> $campos[3],
+						"Universal_Test_ID" 								=> $campos[4],
+						"Priority" 											=> $campos[5],
+						"Requested_Ordered_Date_and_Time" 					=> $campos[6],
+						"Specimen_Collection_Date_and_Time" 				=> $campos[7],
+						"Collection_End_Time" 								=> $campos[8],
+						"Collection_Volume" 								=> $campos[9],
+						"Collector_ID" 										=> $campos[10],
+						"Action_Code" 										=> $campos[11],
+						"Danger_Code" 										=> $campos[12],
+						"Relevant_Clinical_Informations" 					=> $campos[13],
+						"Date_Time_Specimen_Received" 						=> $campos[14],
+						"Specimen_Descriptor" 								=> $campos[15],
+						"Ordering_Physician" 								=> $campos[16],
+						"Physician_Tel_Nb" 									=> $campos[17],
+						"User_Field_1" 										=> $campos[18],
+						"User_Field_2" 										=> $campos[19],
+						"Laboratory_Field_1" 								=> $campos[20],
+						"Laboratory_Field_2" 								=> $campos[21],
+						"Date_and_Time_Results_reported_or_last_modified" 	=> $campos[22],
+						"Instrument_Charge_to_Computer_System" 				=> $campos[23],
+						"Instrument_Section_ID" 							=> $campos[24],
+						"Report_Types" 										=> $campos[25],
+						"Reserved" 											=> $campos[26],
+						"Location_or_Ward_of_Specimen_Collection" 			=> $campos[27],
+						"Nosocomial_Infection_Flag" 						=> $campos[28],
+						"Specimen_Service" 									=> $campos[29],
+						"Specimen_institution" 								=> $campos[30],
+						"Status"                                            => $Status,
+						"Checksum" 											=> $ck
+					}
 			);
 	}
 	elsif($FrameType =~ /R|r/)
 	{
 		$id = $RID;
-		%Data = 
+		%Data =
 			(
-				"Result_$id" => 
-				{ 
-					"Result_ID"                                     => $RID,
-					"Orden_ID"									    => $OID,
-					"Sequence" 										=> $campos[1],
-					"Universal_Test_ID" 							=> $campos[2],
-					"Data_or_Measurement_value" 					=> $campos[3],
-					"Unit" 											=> $campos[4],
-					"Reference_Range" 								=> $campos[5],
-					"Result_Abnormal_Flag" 							=> $campos[6],
-					"Nature_of_Abnormality_Testing" 				=> $campos[7],
-					"Result_Status" 								=> $campos[8],
-					"Date_of_Change_in_Normative_Values_or_Units" 	=> $campos[9],
-					"Operator_Identification" 						=> $campos[10],
-					"Date_Time_Test_Starting" 						=> $campos[11],
-					"Date_Time_Test_Completed" 						=> $campos[12],
-					"Instrument_Identification" 					=> $campos[13],
-					"Status"                                        => $Status,
-					"Checksum" 										=> $ck
-				}
+				"Result_$id" =>
+					{
+						"Result_ID"                                     => $RID,
+						"Orden_ID"									    => $OID,
+						"Sequence" 										=> $campos[1],
+						"Universal_Test_ID" 							=> $campos[2],
+						"Data_or_Measurement_value" 					=> $campos[3],
+						"Unit" 											=> $campos[4],
+						"Reference_Range" 								=> $campos[5],
+						"Result_Abnormal_Flag" 							=> $campos[6],
+						"Nature_of_Abnormality_Testing" 				=> $campos[7],
+						"Result_Status" 								=> $campos[8],
+						"Date_of_Change_in_Normative_Values_or_Units" 	=> $campos[9],
+						"Operator_Identification" 						=> $campos[10],
+						"Date_Time_Test_Starting" 						=> $campos[11],
+						"Date_Time_Test_Completed" 						=> $campos[12],
+						"Instrument_Identification" 					=> $campos[13],
+						"Status"                                        => $Status,
+						"Checksum" 										=> $ck
+					}
 			);
 	}
 	elsif($FrameType =~ /C|c/)
@@ -491,30 +505,30 @@ sub Send2MySQL
 		elsif($RefField =~ /Patient_ID/g) { $FrameType = "PC"; }
 		elsif($RefField =~ /Orden_ID/g)   { $FrameType = "OC"; }
 		elsif($RefField =~ /Result_ID/g)  { $FrameType = "RC"; }
-		%Data = 
-			( 
-				"Comment_$id" => 
-				{	
-					"Comment_ID"      => $CID,
-					$RefField         => "$PPID",
-					"Sequence" 		  => $campos[1], 
-					"Comment_Source"  => $campos[2], 
-					"Text" 			  => $campos[3], 
-					"Comment_Type"	  => $campos[4], 
-					"Status"    	  => $Status,
-					"Checksum" 		  => $ck 
-				}
+		%Data =
+			(
+				"Comment_$id" =>
+					{
+						"Comment_ID"      => $CID,
+						$RefField         => $PPID,
+						"Sequence" 		  => $campos[1],
+						"Comment_Source"  => $campos[2],
+						"Text" 			  => $campos[3],
+						"Comment_Type"	  => $campos[4],
+						"Status"    	  => $Status,
+						"Checksum" 		  => $ck
+					}
 			);
 	}
 	else { return; }
-	# Elimina campos del registro no definidos para acelerar el INSERT 
-	for my $val ( keys %Data ) 
+	# Elimina campos del registro no definidos para acelerar el INSERT
+	for my $val ( keys %Data )
 	{
-		for my $val2 ( keys %{ $Data{$val} } ) 
+		for my $val2 ( keys %{ $Data{$val} } )
 		{
-			delete $Data{$val}{$val2} if((not defined $Data{$val}{$val2}) || length($Data{$val}{$val2}) == 0); 
+			delete $Data{$val}{$val2} if((not defined $Data{$val}{$val2}) || length($Data{$val}{$val2}) == 0);
 		}
-	} 
+	}
 	# print Dumper(%Data);
 	# Envia la salia al SQL o a la PANTALLA
 	if($output eq "sql") { insertSQL($id,$FrameType,%Data); }
@@ -524,21 +538,28 @@ sub Send2MySQL
 sub updateNumPac
 {
 	my ($id, $numpac) = @_;
-	
-    $id //= '';
+
+	$id //= '';
 	$numpac //= 0;
 
-	# Realizamos la conexión a la base de datos 
+	# check if database is still connected
+
+	unless ($dbh->ping) {
+		my $connectionInfo="DBI:mysql:database=$db;$host:$port";
+		$dbh = DBI->connect($connectionInfo,$userid,$passwd);
+	}
+
+	# Realizamos la conexión a la base de datos
 	my $SentenciaSQL = "SELECT COUNT(1) FROM Header WHERE Header_ID = '$id';";
 	my $sth = $dbh->prepare($SentenciaSQL);
 	$sth->execute();
 	my $exite = $sth->fetch()->[0]; # 0 Implica que el valor es nuevo!
-	if($exite > 0) 
+	if($exite > 0)
 	{
-		#Sentencia SQL 
+		#Sentencia SQL
 		$SentenciaSQL = "UPDATE Header Set NumPac=$numpac WHERE Header_ID = '$id';";
 		$sth = $dbh->prepare($SentenciaSQL);
-		# Ejecutamos el query 
+		# Ejecutamos el query
 		$sth->execute();
 	}
 	$sth->finish();
@@ -548,51 +569,58 @@ sub updateNumPac
 sub insertSQL
 {
 	my ($id, $FrameType, %hash) = @_;
-	
-    $id //= '';
+
+	$id //= '';
 	$FrameType //= '';
-	
+
 	usage() if(!$db || !$host || !$userid || !$passwd);
-	
+
 	my %Tables = (C => "Comment",    H => "Header",    O => "Orden",    P => "Patient",    R => "Result",    PC => "Comment_Patient", OC => "Comment_Orden", RC => "Comment_Result" );
 	my %Fields = (C => "Comment_ID", H => "Header_ID", O => "Orden_ID", P => "Patient_ID", R => "Result_ID", PC => "Comment_ID",      OC => "Comment_ID",    RC => "Comment_ID" );
 
 	return if(not defined $Tables{$FrameType});
 
-	# Realizamos la conexión a la base de datos 
+	# check if database is still connected
+
+	unless ($dbh->ping) {
+		my $connectionInfo="DBI:mysql:database=$db;$host:$port";
+		$dbh = DBI->connect($connectionInfo,$userid,$passwd);
+	}
+
+	# Realizamos la conexión a la base de datos
 	my $SentenciaSQL = "SELECT COUNT(1) FROM $Tables{$FrameType} WHERE $Fields{$FrameType}='$id';";
 	my $sth = $dbh->prepare($SentenciaSQL);
 	$sth->execute();
 	my $exite = $sth->fetch()->[0]; # 0 Implica que el valor es nuevo!
-	if($exite == 0) 
+	if($exite == 0)
 	{
 		my $sujeto = "";
 		my $predicado = "";
 		foreach my $k (keys %hash)
 		{
-		my @keys   = keys %{$hash{$k}};
-		my @values = values %{$hash{$k}};
-		my $elementos = scalar(@keys);
-		my $cont = 1;
-		
-		foreach my $valor (@keys) 
-		{ 
-			$sujeto    .= "$valor"; 
-			$predicado .= "'$hash{$k}{$valor}'";
-			if($cont < $elementos)
+			my @keys   = keys %{$hash{$k}};
+			my @values = values %{$hash{$k}};
+			my $elementos = scalar(@keys);
+			my $cont = 1;
+
+			foreach my $valor (@keys)
 			{
-			$sujeto    .= ",";
-			$predicado .= ",";
+				$sujeto    .= "$valor";
+				$predicado .= "'$hash{$k}{$valor}'";
+				if($cont < $elementos)
+				{
+					$sujeto    .= ",";
+					$predicado .= ",";
+				}
+				$cont++;
 			}
-			$cont++;
-		}		
-		#Sentencia SQL 
-		$SentenciaSQL = "INSERT INTO $Tables{$FrameType}($sujeto) VALUES ($predicado);";
-		
-		$sth = $dbh->prepare($SentenciaSQL);
-		
-		# Ejecutamos el query 
-		$sth->execute();
+			#Sentencia SQL
+			$SentenciaSQL = "INSERT INTO $Tables{$FrameType}($sujeto) VALUES ($predicado);";
+
+			$sth = $dbh->prepare($SentenciaSQL);
+
+			# Ejecutamos el query
+			$sth->execute();
 		}
 	}
 	else { logInfo("\t- Registro Duplicado $Fields{$FrameType}:[$id] en la tabla $Tables{$FrameType}\n"); }
@@ -612,7 +640,7 @@ sub ChkSUM
 
 sub logInfo
 {
-    return unless (@_ == 1);
+	return unless (@_ == 1);
 	my ($data) = shift;
 	$data //= '';
 	my $logtime = strftime "%Y-%m-%d %H:%M:%S", localtime;
@@ -622,45 +650,45 @@ sub logInfo
 
 sub updateTRC
 {
-    return unless (@_ == 2);
+	return unless (@_ == 2);
 	my ($filename, $data) = @_;
-	
+
 	$filename //= '';
 	$data //= '';
 	#return if(length($filename) == 0 || length($data) == 0);
 	return unless (length $filename and length $data);
-	
+
 	open(DT, ">>${filename}.trc");
 	flock(DT, LOCK_EX); # try to lock the file exclusively, will wait till you get the lock
-	print DT $data; 
+	print DT $data;
 	flock(DT, LOCK_UN);
 	close(DT);
 }
 
-sub openPort($) 
-{ 
-    my ($device) = @_; 
+sub openPort($)
+{
+	my ($device) = @_;
 
-    #my $serial = Device::SerialPort->new ($device, 1); # on UNIX 
-    my $serial = Win32::SerialPort->new ($device, 1); # on Windows 
-    die "No se puede abrir el puerto serie: $^E\n" unless ($serial); 
-    $serial->user_msg(1); 
-    $serial->baudrate($baudrate); 
-    $serial->databits($databits); 
-    $serial->parity($parity); 
-    $serial->stopbits($stopbits); 
-    $serial->handshake($handshake); 
+	my $serial = Device::SerialPort->new ($device, 1); # on UNIX
+	#my $serial = Win32::SerialPort->new ($device, 1); # on Windows
+	die "No se puede abrir el puerto serie: $^E $device \n" unless ($serial);
+	$serial->user_msg(1);
+	$serial->baudrate($baudrate);
+	$serial->databits($databits);
+	$serial->parity($parity);
+	$serial->stopbits($stopbits);
+	$serial->handshake($handshake);
 	$serial->write_settings;
 	#$serial->save("$device.cfg") if($args{s});
 	#print "wrote configuration file $device.cfg\n";
-    return $serial; 
-} 
+	return $serial;
+}
 
-sub closePort($) 
-{ 
-    my ($serial) = @_; 
-    $serial->close(); 
-	undef $serial; 
+sub closePort($)
+{
+	my ($serial) = @_;
+	$serial->close();
+	undef $serial;
 	logInfo("DataLogger is OFF\n");
 }
 
@@ -668,11 +696,11 @@ sub usage
 {
 	print "Usage:\n";
 	print "\n";
-	
-	print "usage: DataLogger 
+
+	print "usage: DataLogger
                   -debug : Modo DEBUG\n
                   -schema: Crea Schema de MySQL (ASTM-Schema.sql).\n\n";
-	print "  # DataLogger -debug\n";	
+	print "  # DataLogger -debug\n";
 	print "  # DataLogger -schema\n";
 	print "\n Nota: Toda la configuracion se define en el archivo DataLogger.conf\n";
 	exit;
@@ -680,9 +708,9 @@ sub usage
 
 sub schema
 {
- my $filename = "ASTM-Schema.sql";
- open(my $fh, ">$filename") or die "cannot open $filename: $!";
- print $fh <<__HELP__;
+	my $filename = "ASTM-Schema.sql";
+	open(my $fh, ">$filename") or die "cannot open $filename: $!";
+	print $fh <<__HELP__;
 /*
 MySQL - 5.1.53 : Database - ASTM
 *********************************************************************
@@ -1119,7 +1147,7 @@ UNLOCK TABLES;
 /*!40014 SET UNIQUE_CHECKS=\@OLD_UNIQUE_CHECKS */;
 /*!40111 SET SQL_NOTES=\@OLD_SQL_NOTES */;
 __HELP__
- close($fh) || warn "close failed: $!";
- print "Schema $filename creado.\n";
- exit;
+	close($fh) || warn "close failed: $!";
+	print "Schema $filename creado.\n";
+	exit;
 }
