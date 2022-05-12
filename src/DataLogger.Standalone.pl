@@ -26,6 +26,8 @@ use Time::HiRes qw(usleep time alarm sleep);
 use Fcntl ':flock';
 #use File::stat;
 #use Data::Dumper;
+use utf8;
+use open ':std', ':encoding(UTF-8)';
 
 BEGIN { open(STDERR, ">DataLogger.err") || die "Can't write to file: $!\n";  }
 # turn on autoflush
@@ -143,8 +145,12 @@ print "DataLogger is ON [$logtime]\n" if(!$quiet);
 print "Open Serial Port : $DEVICE, $baudrate, $databits, $parity, $stopbits, $handshake\n"  if(!$quiet);
 if($output eq "sql")
 {
-	my $connectionInfo="DBI:mysql:database=$db;$host:$port";
-	$dbh = DBI->connect($connectionInfo,$userid,$passwd);
+	my $connectionInfo="dbi:mysql:database=$db;$host;$port";
+	$dbh = DBI->connect($connectionInfo,$userid,$passwd,{
+		PrintError => 0,
+		RaiseError => 1,
+		mysql_enable_utf8mb4 => 1,  # Switch to UTF-8 for communication and decode.
+	});
 }
 my ($ENQ) = 0;
 my ($BytesRX) = 0;
